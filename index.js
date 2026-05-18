@@ -36,6 +36,22 @@ const client = new Client({
 // Store current voice channel users
 const currentUsers = new Map();
 
+// ─── Lobby category configuration ───────────────────────────────────────────
+// To add a new lobby: add an entry with the exact Discord category name.
+// The key becomes the lobby ID used in Firebase paths.
+const LOBBY_CATEGORIES = {
+  male:   'صالة السادة',
+  female: 'صالة السيدات',
+};
+
+function resolveLobby(categoryName) {
+  for (const [lobbyId, catName] of Object.entries(LOBBY_CATEGORIES)) {
+    if (catName === categoryName) return lobbyId;
+  }
+  return null; // channel not in any known lobby
+}
+// ────────────────────────────────────────────────────────────────────────────
+
 // Function to scan all voice channels and update Firebase
 async function scanVoiceChannels(guild) {
   const usersInVoice = new Map();
@@ -43,17 +59,25 @@ async function scanVoiceChannels(guild) {
   // Iterate through all voice channels
   guild.channels.cache.forEach(channel => {
     if (channel.isVoiceBased()) {
+      // Read the parent category (null if the channel has no category)
+      const categoryName = channel.parent ? channel.parent.name : null;
+      const categoryId   = channel.parent ? channel.parent.id   : null;
+      const lobby        = resolveLobby(categoryName);
+
       channel.members.forEach(member => {
         // Use Discord username (not display name or server nickname)
         const username = member.user.username;
         
         usersInVoice.set(member.id, {
-          username: username,
-          channelName: channel.name,
-          channelId: channel.id,
-          userId: member.id,
-          avatar: member.user.displayAvatarURL(),
-          joinedAt: Date.now()
+          username,
+          channelName:  channel.name,
+          channelId:    channel.id,
+          categoryName, // e.g. "صالة السادة"
+          categoryId,
+          lobby,        // "male" | "female" | null
+          userId:       member.id,
+          avatar:       member.user.displayAvatarURL(),
+          joinedAt:     Date.now()
         });
       });
     }
@@ -64,12 +88,15 @@ async function scanVoiceChannels(guild) {
   
   // Add/update users currently in voice
   usersInVoice.forEach((userData, userId) => {
-    updates[`users/${userId}/username`] = userData.username;
-    updates[`users/${userId}/channelName`] = userData.channelName;
-    updates[`users/${userId}/channelId`] = userData.channelId;
-    updates[`users/${userId}/avatar`] = userData.avatar;
-    updates[`users/${userId}/status`] = 'in-voice';
-    updates[`users/${userId}/lastSeen`] = { ".sv": "timestamp" };
+    updates[`users/${userId}/username`]     = userData.username;
+    updates[`users/${userId}/channelName`]  = userData.channelName;
+    updates[`users/${userId}/channelId`]    = userData.channelId;
+    updates[`users/${userId}/categoryName`] = userData.categoryName;
+    updates[`users/${userId}/categoryId`]   = userData.categoryId;
+    updates[`users/${userId}/lobby`]        = userData.lobby;
+    updates[`users/${userId}/avatar`]       = userData.avatar;
+    updates[`users/${userId}/status`]       = 'in-voice';
+    updates[`users/${userId}/lastSeen`]     = { ".sv": "timestamp" };
   });
 
   // Mark users who left as offline
