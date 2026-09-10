@@ -1,17 +1,21 @@
 {
   "name": "discord-presence-bot",
-  "version": "1.0.0",
-  "description": "Discord bot that syncs voice channel presence to Firebase",
+  "version": "2.0.0",
+  "description": "MdwnhBot — relays who is speaking in the Discord call to مقر المدونة's WebSocket relay",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=22.12.0"
   },
   "keywords": [],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "discord.js": "^14.14.1",
-    "firebase-admin": "^12.0.0",
-    "dotenv": "^16.0.0"
+    "@discordjs/voice": "^0.19.2",
+    "discord.js": "^14.27.0",
+    "dotenv": "^16.4.5",
+    "ws": "^8.21.3"
   }
 }

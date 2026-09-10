@@ -1,0 +1,6 @@
+node_modules/
+.env
+# Firebase service-account key — never commit (the bot doesn't use Firebase any more).
+serviceAccountKey*.json*
+._*
+.DS_Store
