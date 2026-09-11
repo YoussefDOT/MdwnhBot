@@ -6,6 +6,16 @@
 // site draws the green outline around whoever is talking at the meeting table
 // and fades out whoever is in the call but quiet.
 //
+// WHICH call it sits in — and it sits in none unless it's wanted:
+//   1. Summoned: @mention it (or its role) anywhere in the server and it comes to
+//      YOUR current call, whatever the site is doing. It stays while you're in it.
+//   2. Following the meeting: members seated at the site's meeting table announce
+//      it over the relay ({t:'meet',uid,on:1} every 20 s, on:0 on standing). The bot
+//      joins the call most of them are in, and never hops mid-meeting.
+//   3. Otherwise it leaves — LEAVE_GRACE_MS after the table empties, straight away if
+//      the call does. Disconnected by hand (right-click → Disconnect) = it stays out
+//      of that call for KICK_COOLDOWN_MS (a new mention overrides that).
+//
 // ZERO Firebase: speaking flips several times a second, which is exactly the kind
 // of state that must never be written to the database. The old version of this
 // bot mirrored voice-channel members into `users/{uid}` every 10 s — the site
@@ -16,6 +26,7 @@
 // Messages it sends (the relay forwards raw bytes, so nothing server-side changed):
 //   {t:'spk', uid:'mdwnhbot', s:'<discordId>', on:1|0}   the moment it changes
 //   {t:'vc',  uid:'mdwnhbot', ids:[in the call], sp:[talking]}   every 15 s
+//   {t:'meetq', uid:'mdwnhbot'}   on joining a room: "whoever is seated, say so now"
 // A live speaker is re-asserted every 4 s so a lost 'off' can't stick for long.
 // -----------------------------------------------------------------------------
 require('dotenv').config();
@@ -26,21 +37,28 @@ const {
     joinVoiceChannel, getVoiceConnection, VoiceConnectionStatus, entersState,
 } = require('@discordjs/voice');
 
-const VERSION = 'v2-voice';
+const VERSION = 'v3-follow';
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RELAY_BASE = process.env.RELAY_URL || 'wss://mdwnh-presence.yosefbore3y.workers.dev';
 const RELAY_UID = 'mdwnhbot';
 // Discord category → site lobby. A channel under neither talks to both lobbies.
 const LOBBY_CATEGORIES = { male: 'صالة السادة', female: 'صالة السيدات' };
-// Optional: comma-separated voice channel ids the bot may sit in. Empty = it follows
-// whichever voice channel has the most people in it.
+// Optional: comma-separated voice channel ids the bot may FOLLOW a meeting into.
+// Empty = any. A mention ignores this — it goes wherever it was asked to.
 const MEETING_CHANNEL_IDS = (process.env.MEETING_CHANNEL_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean);
 const HEARTBEAT_MS = 15000;
 const SPEAK_REASSERT_MS = 4000;
 const SPEAK_OFF_GRACE_MS = 250;     // Discord ends a "speaking" burst on every short pause
 const RESCAN_DEBOUNCE_MS = 2000;
+// The site re-announces a seat every 20 s — but a background tab's timers get throttled
+// to ~1/min by Chrome, and people at the table flip to Discord all the time. A closed
+// tab doesn't wait this out: the relay's {t:'bye'} for that member drops it at once.
+const SEAT_STALE_MS = 150000;
+const LEAVE_GRACE_MS = 60000;       // table empty → wait this long before leaving the call
+const KICK_COOLDOWN_MS = 10 * 60 * 1000;
+const DISCORD_ID_RE = /^\d{15,22}$/;
 
 const state = {
     guild: null,
@@ -48,6 +66,10 @@ const state = {
     channelName: null,
     lobbies: [],
     speaking: new Map(),            // discordId → { on, offTimer }
+    seated: new Map(),              // discordId → last seat announcement (ms) at the site's table
+    pin: null,                      // { channelId, by } — summoned by a mention
+    kicked: null,                   // { channelId, until } — disconnected by hand
+    leaveAt: 0,                     // when an empty table's grace period runs out
 };
 
 // ── Health check (Render needs a bound port) + keep-alive ─────────────────────
@@ -61,7 +83,8 @@ if (RENDER_URL) {
     setInterval(() => { fetch(RENDER_URL).catch(() => {}); }, 10 * 60 * 1000);
 }
 
-// ── Relay sockets, one per lobby room, open only while the bot is in a call ────
+// ── Relay sockets, one per lobby room, open while anyone is in a call at all ───
+// (it has to hear the table's seat announcements BEFORE it's in a call).
 const relays = {};   // lobby → { ws, retry, want }
 
 function relayOpen(lobby) {
@@ -72,9 +95,13 @@ function relayOpen(lobby) {
     let ws;
     try { ws = new WebSocket(url); } catch (err) { scheduleRelayRetry(lobby); return; }
     r.ws = ws;
-    ws.on('open', () => { console.log(`🔌 relay open: ${lobby}`); sendHeartbeat(); });
-    // Every player's position flows through the room too — the bot has no use for it.
-    ws.on('message', () => {});
+    ws.on('open', () => {
+        console.log(`🔌 relay open: ${lobby}`);
+        sendHeartbeat();
+        // Anyone already at the table re-announces now rather than in up to 20 s.
+        try { ws.send(JSON.stringify({ t: 'meetq', uid: RELAY_UID })); } catch (_) {}
+    });
+    ws.on('message', onRelayMessage);
     ws.on('close', () => { if (r.want) scheduleRelayRetry(lobby); });
     ws.on('error', () => { try { ws.close(); } catch (_) {} });
 }
@@ -95,6 +122,33 @@ function relaySend(obj) {
     for (const lobby of state.lobbies) {
         const ws = relays[lobby] && relays[lobby].ws;
         if (ws && ws.readyState === WebSocket.OPEN) { try { ws.send(data); } catch (_) {} }
+    }
+}
+
+// Every player's position flows through the room too — only the seat announcements
+// matter here, so everything else is dropped before it's parsed. The uid is
+// client-claimed like everything on the relay; the worst a spoof can do is make the
+// bot sit in a call someone is already in.
+function onRelayMessage(data) {
+    const s = data.toString();
+    if (s.indexOf('"meet"') === -1 && s.indexOf('"bye"') === -1) return;
+    let m;
+    try { m = JSON.parse(s); } catch (_) { return; }
+    if (!m || typeof m.uid !== 'string' || !DISCORD_ID_RE.test(m.uid)) return;
+    const had = state.seated.has(m.uid);
+    // Their socket closed (tab shut, network gone). A mere blip re-announces within
+    // seconds of reconnecting, and the grace period covers the gap.
+    if (m.t === 'bye') {
+        if (had) { state.seated.delete(m.uid); scheduleRescan(); }
+        return;
+    }
+    if (m.t !== 'meet') return;
+    if (m.on === 1) {
+        state.seated.set(m.uid, Date.now());
+        if (!had) scheduleRescan();
+    } else if (had) {
+        state.seated.delete(m.uid);
+        scheduleRescan();
     }
 }
 
@@ -140,21 +194,45 @@ setInterval(() => {
     for (const id of speakingIds()) relaySend({ t: 'spk', uid: RELAY_UID, s: id, on: 1 });
 }, SPEAK_REASSERT_MS);
 setInterval(sendHeartbeat, HEARTBEAT_MS);
+// A seat nobody re-announced (tab closed, socket gone) expires without an 'on:0'.
+setInterval(() => {
+    const now = Date.now();
+    for (const at of state.seated.values()) if (now - at > SEAT_STALE_MS) { scheduleRescan(0); return; }
+}, 10000);
 
 // ── Which channel to sit in ───────────────────────────────────────────────────
+function voiceOk(c) {
+    return !!c && c.isVoiceBased() && c.type !== ChannelType.GuildStageVoice && c.id !== c.guild.afkChannelId;
+}
+
 function pickChannel(guild) {
-    const voice = guild.channels.cache.filter(c =>
-        c.isVoiceBased() && c.type !== ChannelType.GuildStageVoice && c.id !== guild.afkChannelId
-        && (!MEETING_CHANNEL_IDS.length || MEETING_CHANNEL_IDS.includes(c.id)));
-    // Stay put while anyone is still here — never hop mid-meeting.
-    if (state.channelId) {
-        const cur = voice.get(state.channelId);
-        if (cur && humansIn(cur).size > 0) return cur;
+    // 1) Summoned: that call, for as long as whoever asked is still in it.
+    if (state.pin) {
+        const vs = guild.voiceStates.cache.get(state.pin.by);
+        const ch = guild.channels.cache.get(state.pin.channelId);
+        if (vs && vs.channelId === state.pin.channelId && voiceOk(ch)) return ch;
+        console.log('📌 summon over — whoever asked left that call');
+        state.pin = null;
+    }
+    // 2) Following the meeting: the call the members at the site's table are in.
+    const kicked = state.kicked && state.kicked.until > Date.now() ? state.kicked.channelId : null;
+    const count = new Map();
+    for (const id of state.seated.keys()) {
+        const vs = guild.voiceStates.cache.get(id);
+        const chId = vs && vs.channelId;
+        if (!chId || chId === kicked) continue;
+        if (MEETING_CHANNEL_IDS.length && !MEETING_CHANNEL_IDS.includes(chId)) continue;
+        count.set(chId, (count.get(chId) || 0) + 1);
+    }
+    // Stay put while anyone at the table is still here — never hop mid-meeting.
+    if (state.channelId && count.has(state.channelId)) {
+        const cur = guild.channels.cache.get(state.channelId);
+        if (voiceOk(cur)) return cur;
     }
     let best = null, most = 0;
-    for (const c of voice.values()) {
-        const n = humansIn(c).size;
-        if (n > most) { best = c; most = n; }
+    for (const [id, n] of count) {
+        const ch = guild.channels.cache.get(id);
+        if (voiceOk(ch) && n > most) { best = ch; most = n; }
     }
     return best;
 }
@@ -167,7 +245,7 @@ function lobbiesFor(channel) {
 
 function leaveVoice() {
     if (!state.guild) return;
-    // Tell the site the call is over before the sockets go.
+    // Tell the site the call is over. The relay sockets stay — rescan() owns them.
     clearSpeaking();
     relaySend({ t: 'vc', uid: RELAY_UID, ids: [], sp: [] });
     const conn = getVoiceConnection(state.guild.id);
@@ -175,9 +253,8 @@ function leaveVoice() {
     if (state.channelId) console.log(`👋 left voice: ${state.channelName}`);
     state.channelId = null;
     state.channelName = null;
-    const was = state.lobbies;
     state.lobbies = [];
-    for (const l of was) relayClose(l);
+    state.leaveAt = 0;
 }
 
 function joinChannel(channel) {
@@ -217,20 +294,43 @@ function joinChannel(channel) {
     conn.on('error', err => console.error('❌ voice error:', err && err.message));
 }
 
-let rescanTimer = null;
-function scheduleRescan() {
-    if (rescanTimer) return;
-    rescanTimer = setTimeout(() => {
-        rescanTimer = null;
-        if (!state.guild) return;
-        const ch = pickChannel(state.guild);
-        if (ch) joinChannel(ch); else leaveVoice();
-        sendHeartbeat();
-    }, RESCAN_DEBOUNCE_MS);
+function rescan() {
+    const g = state.guild;
+    if (!g) return;
+    const now = Date.now();
+    for (const [id, at] of state.seated) if (now - at > SEAT_STALE_MS) state.seated.delete(id);
+    // The relay rooms are only worth listening to while someone is in a call at all.
+    const anyone = g.voiceStates.cache.some(vs =>
+        vs.channelId && vs.id !== client.user.id && !(vs.member && vs.member.user.bot));
+    for (const l of Object.keys(LOBBY_CATEGORIES)) { if (anyone) relayOpen(l); else relayClose(l); }
+
+    const ch = pickChannel(g);
+    if (ch) { state.leaveAt = 0; joinChannel(ch); sendHeartbeat(); return; }
+    if (!state.channelId) return;
+    const cur = g.channels.cache.get(state.channelId);
+    // Nobody left in the call → go now. The table emptied → go after the grace period
+    // (someone standing up for a moment, or reloading, mustn't make it leave and rejoin).
+    if (!cur || humansIn(cur).size === 0) { leaveVoice(); return; }
+    if (!state.leaveAt) state.leaveAt = now + LEAVE_GRACE_MS;
+    if (now >= state.leaveAt) { leaveVoice(); return; }
+    scheduleRescan(state.leaveAt - now + 50);
+}
+
+let rescanTimer = null, rescanDue = 0;
+function scheduleRescan(ms = RESCAN_DEBOUNCE_MS) {
+    const due = Date.now() + ms;
+    if (rescanTimer && rescanDue <= due) return;   // an earlier one is already coming
+    clearTimeout(rescanTimer);
+    rescanDue = due;
+    rescanTimer = setTimeout(() => { rescanTimer = null; rescan(); }, ms);
 }
 
 // ── Discord ───────────────────────────────────────────────────────────────────
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
+// GuildMessages (not privileged) is for the mention summon — a message that mentions
+// the bot arrives with its mentions even without the Message Content intent.
+const client = new Client({ intents: [
+    GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMessages,
+] });
 
 client.once(Events.ClientReady, () => {
     console.log(`🤖 ${VERSION} logged in as ${client.user.tag}`);
@@ -242,10 +342,57 @@ client.once(Events.ClientReady, () => {
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     if (!state.guild) return;
-    if (newState.id === client.user.id || oldState.id === client.user.id) return;
+    if (oldState.id === client.user.id || newState.id === client.user.id) {
+        // Disconnected by hand (right-click → Disconnect): take the hint and stay out of
+        // that call for a while instead of hopping straight back in. Our own leaves
+        // never match — leaveVoice() clears state.channelId before this event lands.
+        if (oldState.channelId && !newState.channelId && oldState.channelId === state.channelId) {
+            state.kicked = { channelId: oldState.channelId, until: Date.now() + KICK_COOLDOWN_MS };
+            if (state.pin && state.pin.channelId === oldState.channelId) state.pin = null;
+            console.log(`🚪 disconnected by hand from ${state.channelName} — staying out for ${KICK_COOLDOWN_MS / 60000} min`);
+            leaveVoice();
+            scheduleRescan();
+        }
+        // Dragged into another call by hand: go along with it (the voice connection
+        // already has), and don't follow the table back into the old one for a while.
+        else if (oldState.channelId && newState.channelId && oldState.channelId !== newState.channelId
+                 && oldState.channelId === state.channelId) {
+            const ch = state.guild.channels.cache.get(newState.channelId);
+            state.kicked = { channelId: oldState.channelId, until: Date.now() + KICK_COOLDOWN_MS };
+            clearSpeaking();
+            relaySend({ t: 'vc', uid: RELAY_UID, ids: [], sp: [] });
+            state.channelId = newState.channelId;
+            state.channelName = ch ? ch.name : null;
+            state.lobbies = ch ? lobbiesFor(ch) : [];
+            for (const l of state.lobbies) relayOpen(l);
+            console.log(`↪️ moved by hand to ${state.channelName}`);
+            sendHeartbeat();
+            scheduleRescan();
+        }
+        return;
+    }
     // Someone left mid-sentence: make sure their green ring goes out.
     if (oldState.channelId === state.channelId && newState.channelId !== state.channelId) speakOff(oldState.id);
     scheduleRescan();
+});
+
+// @MdwnhBot (the user or its role — Discord's autocomplete offers both) → come to the
+// caller's call, whatever the site is doing. No reply text: a 🎧 reaction means it's
+// coming, 🤷 means the caller isn't in a call.
+client.on(Events.MessageCreate, msg => {
+    if (!state.guild || !msg.guild || msg.guild.id !== state.guild.id || msg.author.bot) return;
+    const botRole = msg.guild.members.me && msg.guild.members.me.roles.botRole;
+    const pinged = msg.mentions.users.has(client.user.id)
+        || (botRole && msg.mentions.roles.has(botRole.id));
+    if (!pinged) return;
+    const ch = msg.member && msg.member.voice ? msg.member.voice.channel : null;
+    if (!voiceOk(ch)) { msg.react('🤷').catch(() => {}); return; }
+    state.pin = { channelId: ch.id, by: msg.author.id };
+    if (state.kicked && state.kicked.channelId === ch.id) state.kicked = null;
+    state.leaveAt = 0;
+    console.log(`📣 summoned to ${ch.name} by ${msg.author.tag}`);
+    msg.react('🎧').catch(() => {});
+    scheduleRescan(0);
 });
 
 client.on('error', err => console.error('❌ Discord client error:', err));
