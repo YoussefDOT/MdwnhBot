@@ -12,6 +12,10 @@
 //   2. Following the meeting: members seated at the site's meeting table announce
 //      it over the relay ({t:'meet',uid,on:1} every 20 s, on:0 on standing). The bot
 //      joins the call most of them are in, and never hops mid-meeting.
+//   0. The general meeting (القاعة): while the site's hall is live — its attendees
+//      say {t:'hi'} in the relay's 'stage' room — and someone is in the Discord
+//      STAGE channel, it sits there, above everything else, and also tells the site
+//      who is a speaker: {t:'stage', ids:[in the channel], sp:[speakers]}.
 //   3. Otherwise it leaves — LEAVE_GRACE_MS after the table empties, straight away if
 //      the call does. Disconnected by hand (right-click → Disconnect) = it stays out
 //      of that call for KICK_COOLDOWN_MS (a new mention overrides that).
@@ -37,7 +41,7 @@ const {
     joinVoiceChannel, getVoiceConnection, VoiceConnectionStatus, entersState,
 } = require('@discordjs/voice');
 
-const VERSION = 'v3-follow';
+const VERSION = 'v4-stage';
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RELAY_BASE = process.env.RELAY_URL || 'wss://mdwnh-presence.yosefbore3y.workers.dev';
@@ -48,6 +52,11 @@ const LOBBY_CATEGORIES = { male: 'صالة السادة', female: 'صالة ال
 // Empty = any. A mention ignores this — it goes wherever it was asked to.
 const MEETING_CHANNEL_IDS = (process.env.MEETING_CHANNEL_IDS || '')
     .split(',').map(s => s.trim()).filter(Boolean);
+// القاعة — the general meeting: the Discord Stage channel it is held in, and the relay
+// room both lobbies meet in.
+const STAGE_CHANNEL_ID = process.env.STAGE_CHANNEL_ID || '1489339643215483092';
+const STAGE_ROOM = 'stage';
+const STAGE_LIVE_MS = 150000;       // the hall's "I am here" is every 20 s — ~1/min from a background tab
 const HEARTBEAT_MS = 15000;
 const SPEAK_REASSERT_MS = 4000;
 const SPEAK_OFF_GRACE_MS = 250;     // Discord ends a "speaking" burst on every short pause
@@ -70,6 +79,7 @@ const state = {
     pin: null,                      // { channelId, by } — summoned by a mention
     kicked: null,                   // { channelId, until } — disconnected by hand
     leaveAt: 0,                     // when an empty table's grace period runs out
+    stageLiveAt: 0,                 // last time the site's hall was heard from
 };
 
 // ── Health check (Render needs a bound port) + keep-alive ─────────────────────
@@ -101,7 +111,7 @@ function relayOpen(lobby) {
         // Anyone already at the table re-announces now rather than in up to 20 s.
         try { ws.send(JSON.stringify({ t: 'meetq', uid: RELAY_UID })); } catch (_) {}
     });
-    ws.on('message', onRelayMessage);
+    ws.on('message', lobby === STAGE_ROOM ? onStageRelayMessage : onRelayMessage);
     ws.on('close', () => { if (r.want) scheduleRelayRetry(lobby); });
     ws.on('error', () => { try { ws.close(); } catch (_) {} });
 }
@@ -152,6 +162,33 @@ function onRelayMessage(data) {
     }
 }
 
+// The hall's own room: anything from an attendee means the meeting is live. Only
+// "is it live" matters here, so nothing is parsed beyond the type.
+function stageLive() { return Date.now() - state.stageLiveAt < STAGE_LIVE_MS; }
+function onStageRelayMessage(data) {
+    const s = data.toString();
+    if (s.indexOf('"t":"hi"') === -1) return;
+    const was = stageLive();
+    state.stageLiveAt = Date.now();
+    if (!was) { console.log('🎤 the hall is live'); scheduleRescan(0); }
+}
+function inStage() { return state.channelId === STAGE_CHANNEL_ID; }
+// Who is in the Stage channel, and who of them is a speaker (not suppressed).
+let stageSendTimer = null;
+function sendStage() {
+    if (!inStage() || !state.guild) return;
+    const ch = state.guild.channels.cache.get(STAGE_CHANNEL_ID);
+    if (!ch) return;
+    const humans = humansIn(ch);
+    const sp = [];
+    for (const [id, m] of humans) if (m.voice && m.voice.suppress === false) sp.push(id);
+    relaySend({ t: 'stage', uid: RELAY_UID, ids: [...humans.keys()], sp });
+}
+function scheduleStageSend() {
+    if (stageSendTimer) return;
+    stageSendTimer = setTimeout(() => { stageSendTimer = null; sendStage(); }, 300);
+}
+
 // ── Who's in the call / who's talking ─────────────────────────────────────────
 function humansIn(channel) {
     return channel ? channel.members.filter(m => !m.user.bot) : new Map();
@@ -163,6 +200,7 @@ function sendHeartbeat() {
     if (!state.channelId || !state.guild) return;
     const ch = state.guild.channels.cache.get(state.channelId);
     relaySend({ t: 'vc', uid: RELAY_UID, ids: [...humansIn(ch).keys()], sp: speakingIds() });
+    sendStage();
 }
 function speakOn(id) {
     const s = state.speaking.get(id) || { on: false, offTimer: null };
@@ -198,6 +236,8 @@ setInterval(sendHeartbeat, HEARTBEAT_MS);
 setInterval(() => {
     const now = Date.now();
     for (const at of state.seated.values()) if (now - at > SEAT_STALE_MS) { scheduleRescan(0); return; }
+    // The hall went quiet (the meeting ended): the Stage channel is no longer wanted.
+    if (inStage() && !stageLive()) scheduleRescan(0);
 }, 10000);
 
 // ── Which channel to sit in ───────────────────────────────────────────────────
@@ -206,6 +246,11 @@ function voiceOk(c) {
 }
 
 function pickChannel(guild) {
+    // 0) The general meeting: the Stage channel, while the hall is live and someone is in it.
+    if (stageLive() && !(state.kicked && state.kicked.until > Date.now() && state.kicked.channelId === STAGE_CHANNEL_ID)) {
+        const st = guild.channels.cache.get(STAGE_CHANNEL_ID);
+        if (st && st.isVoiceBased() && humansIn(st).size > 0) return st;
+    }
     // 1) Summoned: that call, for as long as whoever asked is still in it.
     if (state.pin) {
         const vs = guild.voiceStates.cache.get(state.pin.by);
@@ -238,6 +283,7 @@ function pickChannel(guild) {
 }
 
 function lobbiesFor(channel) {
+    if (channel.id === STAGE_CHANNEL_ID) return [STAGE_ROOM];
     const cat = channel.parent ? channel.parent.name : null;
     const hit = Object.entries(LOBBY_CATEGORIES).find(([, name]) => name === cat);
     return hit ? [hit[0]] : Object.keys(LOBBY_CATEGORIES);
@@ -302,7 +348,7 @@ function rescan() {
     // The relay rooms are only worth listening to while someone is in a call at all.
     const anyone = g.voiceStates.cache.some(vs =>
         vs.channelId && vs.id !== client.user.id && !(vs.member && vs.member.user.bot));
-    for (const l of Object.keys(LOBBY_CATEGORIES)) { if (anyone) relayOpen(l); else relayClose(l); }
+    for (const l of [...Object.keys(LOBBY_CATEGORIES), STAGE_ROOM]) { if (anyone) relayOpen(l); else relayClose(l); }
 
     const ch = pickChannel(g);
     if (ch) { state.leaveAt = 0; joinChannel(ch); sendHeartbeat(); return; }
@@ -371,6 +417,8 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
         }
         return;
     }
+    // The Stage channel: someone came, went, was brought up or sent back down.
+    if (inStage() && (oldState.channelId === STAGE_CHANNEL_ID || newState.channelId === STAGE_CHANNEL_ID)) scheduleStageSend();
     // Someone left mid-sentence: make sure their green ring goes out.
     if (oldState.channelId === state.channelId && newState.channelId !== state.channelId) speakOff(oldState.id);
     scheduleRescan();
