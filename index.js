@@ -173,7 +173,10 @@ function onStageRelayMessage(data) {
     if (!was) { console.log('🎤 the hall is live'); scheduleRescan(0); }
 }
 function inStage() { return state.channelId === STAGE_CHANNEL_ID; }
-// Who is in the Stage channel, and who of them is a speaker (not suppressed).
+// Who is in the Stage channel, and who of them is a speaker: not suppressed AND
+// not merely invited. A moderator's «invite to speak» already sets suppress to
+// false, with requestToSpeakTimestamp set until the member accepts — counting
+// that as a speaker put people on the hall's stage who never said yes.
 let stageSendTimer = null;
 function sendStage() {
     if (!inStage() || !state.guild) return;
@@ -181,7 +184,7 @@ function sendStage() {
     if (!ch) return;
     const humans = humansIn(ch);
     const sp = [];
-    for (const [id, m] of humans) if (m.voice && m.voice.suppress === false) sp.push(id);
+    for (const [id, m] of humans) if (m.voice && m.voice.suppress === false && !m.voice.requestToSpeakTimestamp) sp.push(id);
     relaySend({ t: 'stage', uid: RELAY_UID, ids: [...humans.keys()], sp });
 }
 function scheduleStageSend() {
