@@ -50,7 +50,6 @@ const {
     joinVoiceChannel, getVoiceConnection, VoiceConnectionStatus, entersState,
     createAudioPlayer, createAudioResource, StreamType, EndBehaviorType, NoSubscriberBehavior,
 } = require('@discordjs/voice');
-const prism = require('prism-media');
 const { Readable } = require('stream');
 
 const VERSION = 'v5-mic';
@@ -274,7 +273,7 @@ const FV_K = 48000 / 44100;
 const FV_COMBS = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
 const FV_APS = [556, 441, 341, 225];
 const FV_SPREAD = 23;
-const RV_ROOM = 0.88, RV_DAMP = 0.28, RV_WET = 2.6, RV_PREDELAY = Math.round(0.03 * 48000);
+const RV_ROOM = 0.88, RV_DAMP = 0.28, RV_WET = 2.6, RV_PREDELAY = Math.round(0.008 * 48000);   // short: the trip through Discord already delays it
 class Freeverb {
     constructor() {
         const n = (x) => Math.round(x * FV_K);
@@ -305,52 +304,55 @@ class Freeverb {
     }
 }
 const FRAME_BYTES = 960 * 2 * 2;
-let rvRun = null;      // { id, sub, dec, fifo, len, out, timer, player, verb, quiet }
+const OpusScript = require('opusscript');
+// LOW LATENCY, every step of it (the first version queued ~0.4 s):
+//  • the member's packets are decoded the moment they arrive (opusscript, no stream);
+//  • at most RV_IN_MAX frames wait to be used — older audio is dropped, never queued;
+//  • the output is PULLED: the player asks for its next 20 ms packet and only then is
+//    it reverbed and encoded (Opus RESTRICTED_LOWDELAY) — no Node stream buffering
+//    (a piped encoder alone held 16 packets, 320 ms) and no timer of our own;
+//  • when the tail has rung out nothing is produced and the bot falls silent.
+const RV_IN_MAX = 3;
+let rvRun = null;      // { id, sub, dec, enc, fifo, out, player, verb, quiet, want }
 function reverbStart(conn, id) {
     reverbStop();
-    let sub, dec;
+    let sub, dec, enc;
     try {
         sub = conn.receiver.subscribe(id, { end: { behavior: EndBehaviorType.Manual } });
-        dec = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+        dec = new OpusScript(48000, 2, OpusScript.Application.AUDIO);
+        enc = new OpusScript(48000, 2, OpusScript.Application.RESTRICTED_LOWDELAY);
+        try { enc.setBitrate(64000); } catch (_) {}
     } catch (err) { console.error('❌ reverb: cannot listen —', err && err.message); return; }
-    const r = { id, sub, dec, fifo: [], len: 0, verb: new Freeverb(), quiet: 0, out: null, timer: null, player: null };
-    sub.pipe(dec);
-    dec.on('data', (buf) => {
-        r.fifo.push(buf); r.len += buf.length;
-        // never more than ~120 ms behind the voice: older audio is dropped
-        while (r.len > FRAME_BYTES * 6) { r.len -= r.fifo[0].length; r.fifo.shift(); }
-    });
-    dec.on('error', () => {});
-    sub.on('error', () => {});
-    const take = () => {
-        if (r.len < FRAME_BYTES) return null;
-        const out = Buffer.alloc(FRAME_BYTES);
-        let o = 0;
-        while (o < FRAME_BYTES) {
-            const b = r.fifo[0], need = FRAME_BYTES - o;
-            if (b.length <= need) { b.copy(out, o); o += b.length; r.fifo.shift(); }
-            else { b.copy(out, o, 0, need); r.fifo[0] = b.subarray(need); o += need; }
-        }
-        r.len -= FRAME_BYTES;
-        return out;
-    };
-    r.out = new Readable({ read() {} });
+    const r = { id, sub, dec, enc, fifo: [], verb: new Freeverb(), quiet: 0, out: null, player: null, want: false };
     const silence = Buffer.alloc(FRAME_BYTES);
-    // Our own clock: a frame every 20 ms whether or not they are talking, so the tail
-    // rings out after they stop. Once it has died away nothing is pushed, and the
-    // player goes quiet (no speaking light on the bot between sentences).
-    r.timer = setInterval(() => {
-        while (r.out.readableLength < FRAME_BYTES * 3) {
-            const f = take();
-            if (!f && r.quiet > 60) return;
-            const w = r.verb.run(f || silence);
-            if (f) r.quiet = 0; else if (r.verb.tail < 0.002) r.quiet++;
-            r.out.push(w);
+    // one 20 ms packet, made now: the newest voice we have (or silence while the tail rings)
+    const make = () => {
+        const f = r.fifo.shift() || null;
+        if (!f && r.quiet > 40) return null;              // the tail has died away: stay quiet
+        const w = r.verb.run(f || silence);
+        if (f) r.quiet = 0; else if (r.verb.tail < 0.002) r.quiet++;
+        try { return enc.encode(w, 960); } catch (_) { return null; }
+    };
+    const feed = () => {
+        while (r.want) {
+            const pkt = make();
+            if (!pkt) return;
+            r.want = r.out.push(pkt);
         }
-    }, 10);
+    };
+    sub.on('data', (pkt) => {
+        let pcm;
+        try { pcm = dec.decode(pkt); } catch (_) { return; }
+        if (!pcm || pcm.length !== FRAME_BYTES) return;
+        r.fifo.push(pcm);
+        while (r.fifo.length > RV_IN_MAX) r.fifo.shift();   // late audio is worse than lost audio
+        if (r.want) feed();
+    });
+    sub.on('error', () => {});
+    r.out = new Readable({ objectMode: true, highWaterMark: 1, read() { r.want = true; feed(); } });
     r.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play, maxMissedFrames: Infinity } });
     r.player.on('error', (e) => console.error('❌ reverb player:', e && e.message));
-    r.player.play(createAudioResource(r.out, { inputType: StreamType.Raw }));
+    r.player.play(createAudioResource(r.out, { inputType: StreamType.Opus, silencePaddingFrames: 0 }));
     conn.subscribe(r.player);
     rvRun = r;
     console.log(`🎛️ reverb on for ${id}`);
@@ -359,11 +361,11 @@ function reverbStop() {
     const r = rvRun;
     if (!r) return;
     rvRun = null;
-    clearInterval(r.timer);
-    try { r.sub.unpipe(r.dec); r.sub.destroy(); } catch (_) {}
-    try { r.dec.destroy(); } catch (_) {}
+    try { r.sub.removeAllListeners('data'); r.sub.destroy(); } catch (_) {}
     try { r.player.stop(true); } catch (_) {}
     try { r.out.push(null); } catch (_) {}
+    try { r.dec.delete(); } catch (_) {}
+    try { r.enc.delete(); } catch (_) {}
     console.log('🎛️ reverb off');
 }
 // Listening only while the member has the reverb on — off, nothing is subscribed.
