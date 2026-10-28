@@ -32,15 +32,6 @@
 //   {t:'vc',  uid:'mdwnhbot', ids:[in the call], sp:[talking]}   every 15 s
 //   {t:'meetq', uid:'mdwnhbot'}   on joining a room: "whoever is seated, say so now"
 // A live speaker is re-asserted every 4 s so a lost 'off' can't stick for long.
-//
-// v5-mic — منصة الميكروفون (the site's night field, الساحة): a member standing on the
-// stage's mic podium says {t:'mic', uid:<discord id>, on:1, rv:0|1} in the 'stage'
-// room every 4 s. If they are in a Discord call (any voice channel, or the Stage
-// channel), the bot goes there — above every other reason to be anywhere — and, ONLY
-// while rv is 1, listens to that one member and plays back a reverb of their voice
-// (wet only: the dry voice still reaches everyone straight from Discord). rv 0 = it
-// stays, silent, and hears nothing. It answers in the 'stage' room:
-//   {t:'rv', uid:'mdwnhbot', d:<their id>, st:'wait'|'live'|'nocall'|'nospeak'|'off', on:0|1}
 // -----------------------------------------------------------------------------
 require('dotenv').config();
 const http = require('http');
@@ -48,11 +39,9 @@ const WebSocket = require('ws');
 const { Client, GatewayIntentBits, ChannelType, Events } = require('discord.js');
 const {
     joinVoiceChannel, getVoiceConnection, VoiceConnectionStatus, entersState,
-    createAudioPlayer, createAudioResource, StreamType, EndBehaviorType, NoSubscriberBehavior,
 } = require('@discordjs/voice');
-const { Readable } = require('stream');
 
-const VERSION = 'v5-mic';
+const VERSION = 'v4-stage';
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RELAY_BASE = process.env.RELAY_URL || 'wss://mdwnh-presence.yosefbore3y.workers.dev';
@@ -91,10 +80,7 @@ const state = {
     kicked: null,                   // { channelId, until } — disconnected by hand
     leaveAt: 0,                     // when an empty table's grace period runs out
     stageLiveAt: 0,                 // last time the site's hall was heard from
-    mic: null,                      // { id, at, rv } — someone on the field's mic podium
-    selfMute: true,                 // how the current connection was joined
 };
-const MIC_STALE_MS = 13000;         // the podium is re-announced every 4 s
 
 // ── Health check (Render needs a bound port) + keep-alive ─────────────────────
 http.createServer((req, res) => {
@@ -181,199 +167,10 @@ function onRelayMessage(data) {
 function stageLive() { return Date.now() - state.stageLiveAt < STAGE_LIVE_MS; }
 function onStageRelayMessage(data) {
     const s = data.toString();
-    if (s.indexOf('"t":"mic"') !== -1) { onMicMessage(s); return; }
-    if (s.indexOf('"t":"bye"') !== -1 && state.mic && s.indexOf(state.mic.id) !== -1) { micOff(); return; }
     if (s.indexOf('"t":"hi"') === -1) return;
     const was = stageLive();
     state.stageLiveAt = Date.now();
     if (!was) { console.log('🎤 the hall is live'); scheduleRescan(0); }
-}
-
-// ── منصة الميكروفون: the podium on the field's stage ──────────────────────────
-function micLive() { return !!(state.mic && Date.now() - state.mic.at < MIC_STALE_MS); }
-function micChannel() {
-    if (!micLive() || !state.guild) return null;
-    const vs = state.guild.voiceStates.cache.get(state.mic.id);
-    const ch = vs && vs.channelId ? state.guild.channels.cache.get(vs.channelId) : null;
-    return ch && ch.isVoiceBased() && ch.id !== ch.guild.afkChannelId ? ch : null;
-}
-function onMicMessage(s) {
-    let m;
-    try { m = JSON.parse(s); } catch (_) { return; }
-    if (!m || m.t !== 'mic') return;
-    // The site's own login id; `cu` is the member's primary account (an alt logs in
-    // with another). Whichever of the two is in a voice channel is the one.
-    const ids = [m.uid, m.cu].filter(x => typeof x === 'string' && DISCORD_ID_RE.test(x));
-    if (!ids.length) return;
-    if (m.on !== 1) {
-        if (state.mic && ids.includes(state.mic.id)) micOff();
-        return;
-    }
-    // One podium: whoever is already on it keeps it until they step off (or go quiet).
-    if (micLive() && !ids.includes(state.mic.id)) return;
-    let id = ids[0];
-    if (state.guild) for (const x of ids) { const vs = state.guild.voiceStates.cache.get(x); if (vs && vs.channelId) { id = x; break; } }
-    const fresh = !micLive();
-    const rv = m.rv === 1;
-    const was = state.mic && state.mic.rv;
-    state.mic = { id, at: Date.now(), rv };
-    if (!micChannel()) { micStatus('nocall'); reverbStop(); return; }
-    if (fresh || !state.channelId || state.channelId !== micChannel().id) { micStatus('wait'); scheduleRescan(0); return; }
-    if (rv !== was) applyReverb();
-    micStatus(state.selfMute ? 'wait' : (stageBlocked() ? 'nospeak' : 'live'));
-}
-function micOff() {
-    if (!state.mic) return;
-    const id = state.mic.id;
-    state.mic = null;
-    reverbStop();
-    micStatus('off', id);
-    scheduleRescan(0);
-}
-// The bot itself is suppressed in a Stage channel unless it is a speaker.
-function stageBlocked() {
-    const me = state.guild && state.guild.members.me;
-    return !!(me && me.voice && me.voice.channelId === STAGE_CHANNEL_ID && me.voice.suppress);
-}
-function micStatus(st, id) {
-    const ws = relays[STAGE_ROOM] && relays[STAGE_ROOM].ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    const d = id || (state.mic && state.mic.id) || '';
-    const on = st === 'live' && state.mic && state.mic.rv ? 1 : 0;
-    try { ws.send(JSON.stringify({ t: 'rv', uid: RELAY_UID, d, st, on })); } catch (_) {}
-}
-setInterval(() => {
-    if (!state.mic) return;
-    if (!micLive()) { micOff(); return; }
-    micStatus(!micChannel() ? 'nocall' : (state.channelId !== micChannel().id || state.selfMute) ? 'wait' : (stageBlocked() ? 'nospeak' : 'live'));
-}, 4000);
-
-// ── The reverb: Freeverb (Jezar's) — 8 combs, 4 all-passes per side ─────────
-// Wet only, mono in, stereo out. 48 kHz, 20 ms frames of 960 samples.
-class Comb {
-    constructor(n) { this.b = new Float32Array(n); this.i = 0; this.s = 0; }
-    run(x, fb, damp) {
-        const y = this.b[this.i];
-        this.s = y * (1 - damp) + this.s * damp;
-        this.b[this.i] = x + this.s * fb;
-        if (++this.i >= this.b.length) this.i = 0;
-        return y;
-    }
-}
-class AllPass {
-    constructor(n) { this.b = new Float32Array(n); this.i = 0; }
-    run(x) {
-        const bo = this.b[this.i];
-        this.b[this.i] = x + bo * 0.5;
-        if (++this.i >= this.b.length) this.i = 0;
-        return bo - x;
-    }
-}
-const FV_K = 48000 / 44100;
-const FV_COMBS = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
-const FV_APS = [556, 441, 341, 225];
-const FV_SPREAD = 23;
-const RV_ROOM = 0.88, RV_DAMP = 0.28, RV_WET = 2.6, RV_PREDELAY = Math.round(0.008 * 48000);   // short: the trip through Discord already delays it
-class Freeverb {
-    constructor() {
-        const n = (x) => Math.round(x * FV_K);
-        this.cl = FV_COMBS.map(c => new Comb(n(c))); this.cr = FV_COMBS.map(c => new Comb(n(c + FV_SPREAD)));
-        this.al = FV_APS.map(a => new AllPass(n(a))); this.ar = FV_APS.map(a => new AllPass(n(a + FV_SPREAD)));
-        this.pre = new Float32Array(RV_PREDELAY + 1); this.pi = 0;
-        this.fb = RV_ROOM * 0.28 + 0.7; this.damp = RV_DAMP * 0.4;
-        this.tail = 0;
-    }
-    // Int16 interleaved stereo in → Int16 interleaved stereo out (same length).
-    run(inp) {
-        const out = Buffer.alloc(inp.length);
-        const N = inp.length >> 2;
-        let peak = 0;
-        for (let k = 0; k < N; k++) {
-            const x = (inp.readInt16LE(k * 4) + inp.readInt16LE(k * 4 + 2)) / 65536;   // mono, ±1
-            const d = this.pre[this.pi]; this.pre[this.pi] = x * 0.015; if (++this.pi >= this.pre.length) this.pi = 0;
-            let l = 0, r = 0;
-            for (let c = 0; c < 8; c++) { l += this.cl[c].run(d, this.fb, this.damp); r += this.cr[c].run(d, this.fb, this.damp); }
-            for (let a = 0; a < 4; a++) { l = this.al[a].run(l); r = this.ar[a].run(r); }
-            l *= RV_WET; r *= RV_WET;
-            const al = Math.abs(l), ar = Math.abs(r); if (al > peak) peak = al; if (ar > peak) peak = ar;
-            out.writeInt16LE(Math.max(-32767, Math.min(32767, Math.round(l * 32767))), k * 4);
-            out.writeInt16LE(Math.max(-32767, Math.min(32767, Math.round(r * 32767))), k * 4 + 2);
-        }
-        this.tail = peak;
-        return out;
-    }
-}
-const FRAME_BYTES = 960 * 2 * 2;
-const OpusScript = require('opusscript');
-// LOW LATENCY, every step of it (the first version queued ~0.4 s):
-//  • the member's packets are decoded the moment they arrive (opusscript, no stream);
-//  • at most RV_IN_MAX frames wait to be used — older audio is dropped, never queued;
-//  • the output is PULLED: the player asks for its next 20 ms packet and only then is
-//    it reverbed and encoded (Opus RESTRICTED_LOWDELAY) — no Node stream buffering
-//    (a piped encoder alone held 16 packets, 320 ms) and no timer of our own;
-//  • when the tail has rung out nothing is produced and the bot falls silent.
-const RV_IN_MAX = 3;
-let rvRun = null;      // { id, sub, dec, enc, fifo, out, player, verb, quiet, want }
-function reverbStart(conn, id) {
-    reverbStop();
-    let sub, dec, enc;
-    try {
-        sub = conn.receiver.subscribe(id, { end: { behavior: EndBehaviorType.Manual } });
-        dec = new OpusScript(48000, 2, OpusScript.Application.AUDIO);
-        enc = new OpusScript(48000, 2, OpusScript.Application.RESTRICTED_LOWDELAY);
-        try { enc.setBitrate(64000); } catch (_) {}
-    } catch (err) { console.error('❌ reverb: cannot listen —', err && err.message); return; }
-    const r = { id, sub, dec, enc, fifo: [], verb: new Freeverb(), quiet: 0, out: null, player: null, want: false };
-    const silence = Buffer.alloc(FRAME_BYTES);
-    // one 20 ms packet, made now: the newest voice we have (or silence while the tail rings)
-    const make = () => {
-        const f = r.fifo.shift() || null;
-        if (!f && r.quiet > 40) return null;              // the tail has died away: stay quiet
-        const w = r.verb.run(f || silence);
-        if (f) r.quiet = 0; else if (r.verb.tail < 0.002) r.quiet++;
-        try { return enc.encode(w, 960); } catch (_) { return null; }
-    };
-    const feed = () => {
-        while (r.want) {
-            const pkt = make();
-            if (!pkt) return;
-            r.want = r.out.push(pkt);
-        }
-    };
-    sub.on('data', (pkt) => {
-        let pcm;
-        try { pcm = dec.decode(pkt); } catch (_) { return; }
-        if (!pcm || pcm.length !== FRAME_BYTES) return;
-        r.fifo.push(pcm);
-        while (r.fifo.length > RV_IN_MAX) r.fifo.shift();   // late audio is worse than lost audio
-        if (r.want) feed();
-    });
-    sub.on('error', () => {});
-    r.out = new Readable({ objectMode: true, highWaterMark: 1, read() { r.want = true; feed(); } });
-    r.player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play, maxMissedFrames: Infinity } });
-    r.player.on('error', (e) => console.error('❌ reverb player:', e && e.message));
-    r.player.play(createAudioResource(r.out, { inputType: StreamType.Opus, silencePaddingFrames: 0 }));
-    conn.subscribe(r.player);
-    rvRun = r;
-    console.log(`🎛️ reverb on for ${id}`);
-}
-function reverbStop() {
-    const r = rvRun;
-    if (!r) return;
-    rvRun = null;
-    try { r.sub.removeAllListeners('data'); r.sub.destroy(); } catch (_) {}
-    try { r.player.stop(true); } catch (_) {}
-    try { r.out.push(null); } catch (_) {}
-    try { r.dec.delete(); } catch (_) {}
-    try { r.enc.delete(); } catch (_) {}
-    console.log('🎛️ reverb off');
-}
-// Listening only while the member has the reverb on — off, nothing is subscribed.
-function applyReverb() {
-    const conn = state.guild && getVoiceConnection(state.guild.id);
-    const want = !!(state.mic && state.mic.rv && conn && micChannel() && state.channelId === micChannel().id && !state.selfMute);
-    if (want && (!rvRun || rvRun.id !== state.mic.id)) reverbStart(conn, state.mic.id);
-    else if (!want && rvRun) reverbStop();
 }
 function inStage() { return state.channelId === STAGE_CHANNEL_ID; }
 // Who is in the Stage channel, and who of them is a speaker: not suppressed AND
@@ -452,9 +249,6 @@ function voiceOk(c) {
 }
 
 function pickChannel(guild) {
-    // -1) The field's mic podium: wherever its member is in a call, above everything.
-    const mc = micChannel();
-    if (mc) return mc;
     // 0) The general meeting: the Stage channel, while the hall is live and someone is in it.
     if (stageLive() && !(state.kicked && state.kicked.until > Date.now() && state.kicked.channelId === STAGE_CHANNEL_ID)) {
         const st = guild.channels.cache.get(STAGE_CHANNEL_ID);
@@ -502,7 +296,6 @@ function leaveVoice() {
     if (!state.guild) return;
     // Tell the site the call is over. The relay sockets stay — rescan() owns them.
     clearSpeaking();
-    reverbStop();
     relaySend({ t: 'vc', uid: RELAY_UID, ids: [], sp: [] });
     const conn = getVoiceConnection(state.guild.id);
     if (conn) { try { conn.destroy(); } catch (_) {} }
@@ -515,20 +308,8 @@ function leaveVoice() {
 
 function joinChannel(channel) {
     const guild = channel.guild;
-    const mute = !(micChannel() && micChannel().id === channel.id);
-    if (state.channelId === channel.id && getVoiceConnection(guild.id)) {
-        if (mute !== state.selfMute) {
-            // Same call, the podium came or went: rejoin with the new mute (no hop).
-            state.selfMute = mute;
-            joinVoiceChannel({ channelId: channel.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: false, selfMute: mute });
-            if (!mute) stageSpeak(channel);
-            applyReverb();
-        }
-        return;
-    }
-    reverbStop();
+    if (state.channelId === channel.id && getVoiceConnection(guild.id)) return;
     leaveVoice();
-    state.selfMute = mute;
     state.channelId = channel.id;
     state.channelName = channel.name;
     state.lobbies = lobbiesFor(channel);
@@ -543,14 +324,11 @@ function joinChannel(channel) {
         guildId: guild.id,
         adapterCreator: guild.voiceAdapterCreator,
         selfDeaf: false,
-        selfMute: mute,
+        selfMute: true,
     });
     conn.receiver.speaking.on('start', id => speakOn(id));
     conn.receiver.speaking.on('end', id => speakOff(id));
-    conn.on(VoiceConnectionStatus.Ready, () => {
-        console.log('✅ voice ready'); sendHeartbeat();
-        if (!state.selfMute) { stageSpeak(channel); setTimeout(applyReverb, 600); }
-    });
+    conn.on(VoiceConnectionStatus.Ready, () => { console.log('✅ voice ready'); sendHeartbeat(); });
     conn.on(VoiceConnectionStatus.Disconnected, async () => {
         // A move between channels or a network blip: give it a moment to reconnect.
         try {
@@ -565,19 +343,6 @@ function joinChannel(channel) {
     conn.on('error', err => console.error('❌ voice error:', err && err.message));
 }
 
-// In a Stage channel the bot is an audience member until it is made a speaker: it
-// asks to be one (needs «Mute Members» there to do it itself), else it requests to speak.
-function stageSpeak(channel) {
-    if (!channel || channel.type !== ChannelType.GuildStageVoice) return;
-    const me = channel.guild.members.me;
-    setTimeout(() => {
-        if (!me || !me.voice || me.voice.channelId !== channel.id) return;
-        me.voice.setSuppressed(false)
-            .then(() => { console.log('🎤 speaking in the stage'); micStatus('live'); })
-            .catch(() => me.voice.setRequestToSpeak(true).then(() => micStatus('nospeak')).catch(() => micStatus('nospeak')));
-    }, 800);
-}
-
 function rescan() {
     const g = state.guild;
     if (!g) return;
@@ -587,7 +352,6 @@ function rescan() {
     const anyone = g.voiceStates.cache.some(vs =>
         vs.channelId && vs.id !== client.user.id && !(vs.member && vs.member.user.bot));
     for (const l of [...Object.keys(LOBBY_CATEGORIES), STAGE_ROOM]) { if (anyone) relayOpen(l); else relayClose(l); }
-    if (state.mic && !micLive()) micOff();
 
     const ch = pickChannel(g);
     if (ch) { state.leaveAt = 0; joinChannel(ch); sendHeartbeat(); return; }
@@ -658,11 +422,6 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     }
     // The Stage channel: someone came, went, was brought up or sent back down.
     if (inStage() && (oldState.channelId === STAGE_CHANNEL_ID || newState.channelId === STAGE_CHANNEL_ID)) scheduleStageSend();
-    // The podium's member changed call (or left Discord): follow, or say so.
-    if (state.mic && newState.id === state.mic.id) {
-        if (!newState.channelId) { reverbStop(); micStatus('nocall'); }
-        scheduleRescan(0);
-    }
     // Someone left mid-sentence: make sure their green ring goes out.
     if (oldState.channelId === state.channelId && newState.channelId !== state.channelId) speakOff(oldState.id);
     scheduleRescan();
