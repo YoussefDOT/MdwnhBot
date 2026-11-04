@@ -1,7 +1,7 @@
 {
   "name": "discord-presence-bot",
   "version": "2.0.0",
-  "description": "MdwnhBot — relays who is speaking in the Discord call to مقر المدونة's WebSocket relay",
+  "description": "MdwnhBot — relays who is speaking in the Discord call to مقر المدونة's WebSocket relay, and records meetings",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -16,6 +16,8 @@
     "@discordjs/voice": "^0.19.2",
     "discord.js": "^14.27.0",
     "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.3.0",
+    "opusscript": "^0.1.1",
     "ws": "^8.21.3"
   }
 }
