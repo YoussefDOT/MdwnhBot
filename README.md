@@ -18,7 +18,7 @@ is running.
 When it ends, `RECORD_TO` gets a DM with:
 - the call as one mixed MP3 (mono, 32 kbps; cut into 35-minute parts so each one fits
   Discord's 10 MB upload limit);
-- `…-context.md` — written for an AI to transcribe the audio and write the minutes:
+- `…-context.txt` — written for an AI to transcribe the audio and write the minutes (plain text, every line forced right-to-left so it reads correctly in any viewer):
   the meeting (Discord event name / Stage topic / the hall's title), who attended (with
   their team role), **who spoke when** (taken from each person's own stream, so it is
   reliable for telling voices apart), the chat (the channel it was asked in, the call's

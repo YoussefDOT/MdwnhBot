@@ -502,6 +502,15 @@ async function loadTeam() {
     if (list.length) { _team = team; _teamAt = Date.now(); }
     return _team || team;
 }
+// «🪑丨مكتب القائد» → «مكتب القائد»: the server's channel decoration (an emoji and a 丨
+// separator — 丨 is a CJK letter, which also breaks right-to-left text) is not a name.
+function cleanName(s) {
+    const t = String(s || '').replace(/^[^\p{L}\p{N}]*[丨｜|•·]\s*/u, '').replace(/^[^\p{L}\p{N}]+/u, '').trim();
+    return t || String(s || '');
+}
+// «✦ يُـوسُـفْ» and «يوسف» are the same name — don't print it twice.
+const bareName = s => foldAr(s).replace(/[^\p{L}\p{N}]/gu, '');
+const sameName = (a, b) => bareName(a) === bareName(b);
 function memberName(id, fallback) {
     const m = state.guild && state.guild.members.cache.get(id);
     return (m && m.displayName) || fallback || String(id);
@@ -579,7 +588,7 @@ function recStartCommand(msg) {
         return;
     }
     const r = state.rec = {
-        channelId: ch.id, channelName: ch.name, stage: ch.type === ChannelType.GuildStageVoice,
+        channelId: ch.id, channelName: cleanName(ch.name), stage: ch.type === ChannelType.GuildStageVoice,
         by: msg.author.id, byName: memberName(msg.author.id, msg.author.username),
         cmdMsg: msg, cmdChannelId: msg.channelId, chatOn: state.chatOn,
         live: false, t0: 0, conn: null, dir: null, audio: null,
@@ -807,7 +816,7 @@ async function recFinish(r, reason, by) {
     const stamp = fileStamp(r.t0);
     const why = reasonText(reason, by);
     const parts = out.files.map((f, i) => ({ path: f, name: out.files.length === 1 ? `${stamp}.mp3` : `${stamp}-part${i + 1}.mp3` }));
-    const ctxName = `${stamp}-context.md`;
+    const ctxName = `${stamp}-context.txt`;
     const ctxPath = path.join(r.dir, ctxName);
     let ctxOk = false;
     try { fs.writeFileSync(ctxPath, buildContext(r, out, team, why, parts), 'utf8'); ctxOk = true; } catch (_) {}
@@ -873,100 +882,104 @@ function recSummary(r, out, team, why, parts, ctxName) {
 
 // The file for the AI: everything it needs to transcribe the audio, tell the voices
 // apart and write the minutes — and nothing the AI should not see (no emails, no ids).
+// Plain text, not Markdown: a table or a fence is clutter when the file is opened as
+// text. And every line is wrapped RLM + RLE … PDF so it reads right-to-left in ANY
+// viewer — one that takes the direction from the first letter (TextEdit) and one
+// that forces left-to-right (Discord's preview, code editors), where an Arabic line
+// with times and numbers in it otherwise comes out in scrambled order.
+const rtlLine = s => (s ? '‏‫' + s + '‬' : '');
 function buildContext(r, out, team, why, parts) {
     const L = [];
     const title = recTitle(r);
     const people = recAttendees(r, out, team);
     const nameOf = id => (people.find(p => p.id === id) || {}).name || personName(team, id, r.hall.names.get(id));
     const info = r.info || {};
+    const head = s => { if (L.length) L.push(''); L.push(`■ ${s}`); };
 
-    L.push(`# تسجيل اجتماع: ${title}`, '');
-    L.push('هذا الملف يرافق تسجيل الصوت. أعطِ نموذج الذكاء الاصطناعي ملف (ملفات) الصوت مع هذا الملف، ليفرّغ الكلام وينسب كل كلام إلى قائله ويكتب محضر الاجتماع. التعليمات في آخره.', '');
+    L.push(`تسجيل اجتماع: ${title}`);
+    L.push('هذا الملف يرافق تسجيل الصوت. أعطِ نموذج الذكاء الاصطناعي ملف الصوت (أو أجزاءه) مع هذا الملف، ليفرّغ الكلام وينسب كل كلام إلى قائله ويكتب محضر الاجتماع. التعليمات في آخره.');
 
-    L.push('## الاجتماع');
-    L.push(`- العنوان: ${title}`);
-    if (info.event && info.event !== title) L.push(`- فعالية ديسكورد: ${info.event}`);
-    if (info.about) L.push(`- وصف الفعالية: ${chatText(info.about, 1200)}`);
-    if (info.topic && info.topic !== title) L.push(`- موضوع المنصة: ${info.topic}`);
-    if (r.hall.title) L.push(`- اجتماع القاعة في مقر المدونة: «${r.hall.title}»${r.stage ? '' : ' (كان قائمًا في الوقت نفسه)'}`);
-    L.push(`- القناة: ${r.channelName}${r.stage ? ' (منصة Stage في ديسكورد)' : ' (قناة صوتية في ديسكورد)'}`);
-    L.push(`- التاريخ: ${fmtDay(r.t0)} — ${fmtHijri(r.t0)}`);
-    L.push(`- من ${fmtTime(r.t0)} إلى ${fmtTime(r.endedAt)} بتوقيت الرياض (المدة ${clock(out.seconds * 1000)})`);
-    L.push(`- بدأ التسجيل: ${personName(team, r.by, r.byName)} — وانتهى: ${why}`);
-    L.push('- الفريق: فريق المدونة', '');
+    head('الاجتماع');
+    L.push(`• العنوان: ${title}`);
+    if (info.event && info.event !== title) L.push(`• فعالية ديسكورد: ${info.event}`);
+    if (info.about) L.push(`• وصف الفعالية: ${chatText(info.about, 1200).replace(/ ⏎ /g, ' / ')}`);
+    if (info.topic && info.topic !== title) L.push(`• موضوع المنصة: ${info.topic}`);
+    if (r.hall.title) L.push(`• اجتماع القاعة في مقر المدونة: «${r.hall.title}»${r.stage ? '' : ' (كان قائمًا في الوقت نفسه)'}`);
+    L.push(`• القناة: ${r.channelName} (${r.stage ? 'منصة Stage في ديسكورد' : 'قناة صوتية في ديسكورد'})`);
+    L.push(`• التاريخ: ${fmtDay(r.t0)}، الموافق ${fmtHijri(r.t0)}`);
+    L.push(`• الوقت: من ${fmtTime(r.t0)} إلى ${fmtTime(r.endedAt)} بتوقيت الرياض، والمدة ${clock(out.seconds * 1000)}`);
+    L.push(`• بدأ التسجيل: ${personName(team, r.by, r.byName)}، وانتهى: ${why}`);
+    L.push('• الفريق: فريق المدونة');
 
-    L.push('## ملفات الصوت');
-    if (!parts.length) L.push('- لم يُحفظ صوت.');
+    head('ملفات الصوت');
+    if (!parts.length) L.push('• لم يُحفظ صوت.');
     parts.forEach((p, i) => {
         const a = i * out.segSeconds, b = Math.min(out.seconds, (i + 1) * out.segSeconds);
-        L.push(`- \`${p.name}\`: من ${clock(a * 1000)} إلى ${clock(b * 1000)}`);
+        // Arabic first: a line that opens with the (Latin) file name flips left-to-right.
+        L.push(`• ${parts.length === 1 ? 'الصوت' : `الجزء ${i + 1}`}: من ${clock(a * 1000)} إلى ${clock(b * 1000)} (الملف ${p.name})`);
     });
-    L.push('- الصوت مزيج واحد لكل المتحدثين (أحادي، 24 kHz، MP3). كل الأوقات في هذا الملف من بداية التسجيل؛ لجزء بعد الأول اطرح وقت بدايته.', '');
+    L.push('• الصوت مزيج واحد لكل المتحدثين (أحادي 24 kHz بصيغة MP3).');
+    L.push('• كل الأوقات في هذا الملف من بداية التسجيل؛ ولجزء بعد الأول اطرح وقت بدايته.');
 
-    L.push('## الحضور');
-    if (!people.length) L.push('لا أحد.');
-    else {
-        L.push('| الاسم | الدور في الفريق | الأقسام | مدة الحضور | مدة الكلام |', '|---|---|---|---|---|');
-        for (const p of people) {
-            const n = p.name + (p.discord && p.discord !== p.name ? ` (في ديسكورد: ${p.discord})` : '');
-            L.push(`| ${mdCell(n)} | ${mdCell(p.team && p.team.role)} | ${mdCell(p.team && p.team.depts.join('، '))} | ${clock(p.ms)} | ${clock(p.talk * 1000)} |`);
-        }
+    head(`الحضور (${people.length})`);
+    if (!people.length) L.push('• لا أحد.');
+    for (const p of people) {
+        const t = p.team;
+        let line = `• ${p.name}`;
+        if (p.discord && !sameName(p.discord, p.name)) line += ` (اسمه في ديسكورد: ${p.discord})`;
+        if (t && t.role) line += ` — ${t.role}`;
+        if (t && t.depts.length) line += ` (${t.depts.join('، ')})`;
+        line += ` — حضر ${clock(p.ms)}، وتكلّم ${clock(p.talk * 1000)}`;
+        L.push(line);
     }
     const hallOnly = [...r.hall.names.keys()].filter(id => !r.people.has(id)).map(id => personName(team, id, r.hall.names.get(id)));
-    if (hallOnly.length) L.push('', `حضروا القاعة في مقر المدونة دون المكالمة: ${hallOnly.join('، ')}.`);
-    L.push('');
+    if (hallOnly.length) L.push(`• حضروا القاعة في مقر المدونة دون المكالمة: ${hallOnly.join('، ')}`);
 
-    L.push('## من تكلّم متى');
-    L.push('كل سطر فترة كلام متصلة لشخص واحد (ساعة:دقيقة:ثانية من بداية التسجيل). سطران متداخلان = تكلّما في الوقت نفسه. مأخوذ من بثّ كل شخص على حدة، فهو موثوق لمعرفة القائل.');
-    if (!out.turns.length) L.push('', 'لم يتكلم أحد.');
-    else {
-        L.push('', '```text');
-        for (const g of out.turns.slice(0, 6000)) L.push(`${clock(g.a * 1000)} – ${clock(g.b * 1000)}  ${nameOf(g.id)}`);
-        L.push('```');
-    }
-    L.push('');
+    head('من تكلّم متى');
+    L.push('كل سطر فترة كلام متصلة لشخص واحد (ساعة:دقيقة:ثانية من بداية التسجيل). سطران متداخلان يعنيان أنهما تكلّما في الوقت نفسه. أُخذ هذا من صوت كل شخص على حدة، فهو موثوق لمعرفة القائل.');
+    if (!out.turns.length) L.push('• لم يتكلم أحد.');
+    for (const g of out.turns.slice(0, 6000)) L.push(`[${clock(g.a * 1000)} – ${clock(g.b * 1000)}] ${nameOf(g.id)}`);
 
-    L.push('## المحادثة النصية أثناء الاجتماع');
-    if (!r.chatOn) L.push('- لم تُحفظ رسائل ديسكورد (البوت لا يملك إذن قراءة الرسائل).');
+    head('المحادثة النصية أثناء الاجتماع');
+    if (!r.chatOn) L.push('• لم تُحفظ رسائل ديسكورد (البوت لا يملك إذن قراءة الرسائل).');
     const groups = new Map();
     for (const e of r.chat) { if (!groups.has(e.src)) groups.set(e.src, []); groups.get(e.src).push(e); }
     const srcName = src => {
         if (src === 'hall') return `تعليقات القاعة في مقر المدونة${r.hall.title ? ` («${r.hall.title}»)` : ''}`;
         if (src === r.channelId) return `محادثة المكالمة نفسها (${r.channelName})`;
         const c = state.guild && state.guild.channels.cache.get(src);
-        return `#${c ? c.name : src} (القناة التي طُلب فيها التسجيل)`;
+        return `قناة ${c ? cleanName(c.name) : src} (حيث طُلب التسجيل)`;
     };
-    if (!r.chat.length) L.push('- لم يُكتب شيء أثناء التسجيل.');
+    if (!r.chat.length) L.push('• لم يُكتب شيء أثناء التسجيل.');
     for (const [src, list] of groups) {
-        L.push('', `### ${srcName(src)}`);
+        L.push(`— ${srcName(src)}:`);
         for (const e of list) {
             const who = src === 'hall' ? personName(team, e.uid, r.hall.names.get(e.uid)) : personName(team, e.uid, e.name);
-            let line = `- [${clock(e.t)}] ${who}: ${e.text || ''}`.trimEnd();
+            let line = `[${clock(e.t)}] ${who}: ${(e.text || '').replace(/ ⏎ /g, ' / ')}`.trimEnd();
             if (e.reply) line += ' (ردًّا على رسالة سابقة)';
-            for (const f of e.files) line += ` [مرفق: ${f}]`;
+            for (const f of e.files) line += ` (مرفق: ${f})`;
             L.push(line);
         }
     }
-    if (r.chat.length >= REC_CHAT_MAX) L.push('', `(حُفظت أول ${REC_CHAT_MAX} رسالة فقط.)`);
-    L.push('');
+    if (r.chat.length >= REC_CHAT_MAX) L.push(`(حُفظت أول ${REC_CHAT_MAX} رسالة فقط.)`);
 
     if (team.list.length) {
-        L.push('## أسماء الفريق (لكتابتها كما ينبغي)');
-        L.push(team.list.map(t => t.name + (t.role ? ` (${t.role})` : '')).join('، ') + '.', '');
+        head('أسماء الفريق (لكتابتها كما ينبغي)');
+        L.push(team.list.map(t => t.name + (t.role ? ` (${t.role})` : '')).join('، ') + '.');
     }
 
-    L.push('## المطلوب من النموذج');
+    head('المطلوب من النموذج');
     L.push('1. فرّغ الكلام كاملًا كما قيل. الكلام عربي وقد يكون بلهجة عامية ويتخلله إنجليزي: اكتب العامية كما نُطقت ولا تحوّلها إلى الفصحى.');
-    L.push('2. انسب كل مقطع إلى قائله بجدول «من تكلّم متى»، واكتب الأسماء كما في قائمة الفريق. إن لم يتّضح القائل أو تداخل اثنان فاكتب [غير واضح].');
-    L.push('3. ثم اكتب المحضر: ملخص في بضعة أسطر، القرارات، المهام (من؟ ماذا؟ متى إن ذُكر موعد)، الأسئلة المعلّقة، والمواعيد القادمة.');
+    L.push('2. انسب كل مقطع إلى قائله بقائمة «من تكلّم متى»، واكتب الأسماء كما في أسماء الفريق. إن لم يتّضح القائل أو تداخل اثنان فاكتب [غير واضح].');
+    L.push('3. ثم اكتب المحضر: ملخص في بضعة أسطر، والقرارات، والمهام (من؟ ماذا؟ متى إن ذُكر موعد)، والأسئلة المعلّقة، والمواعيد القادمة.');
     L.push('4. استعن بالمحادثة النصية (الروابط والملاحظات والاقتراحات) في موضعها من الوقت.');
-    L.push('5. لا تضف شيئًا لم يُقل، ولا تخمّن الأرقام والمواعيد.', '');
+    L.push('5. لا تضف شيئًا لم يُقل، ولا تخمّن الأرقام والمواعيد.');
 
     const names = [...new Set(people.map(p => p.name))].slice(0, 25);
-    L.push('## نص تمهيدي قصير لنموذج التفريغ');
-    L.push('(نماذج مثل Whisper تقبل نصًا تمهيديًا قصيرًا يحسّن كتابة الأسماء.)', '');
-    L.push(`> اجتماع فريق المدونة: «${title}». المتحدثون: ${names.join('، ') || '—'}. مقر المدونة، ليمو.`);
-    return L.join('\n') + '\n';
+    head('نص تمهيدي قصير لنموذج التفريغ');
+    L.push('(نماذج مثل Whisper تقبل نصًا تمهيديًا قصيرًا يحسّن كتابة الأسماء.)');
+    L.push(`اجتماع فريق المدونة: «${title}». المتحدثون: ${names.join('، ') || 'لا أحد'}. مقر المدونة، ليمو.`);
+    return L.map(rtlLine).join('\n') + '\n';
 }
 
 // ── Discord ───────────────────────────────────────────────────────────────────
