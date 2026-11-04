@@ -116,7 +116,7 @@ const state = {
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     const rec = state.rec && state.rec.live ? ` — recording ${clock(Date.now() - state.rec.t0)}` : '';
-    res.end(`MdwnhBot ${VERSION} alive — voice: ${state.channelName || 'idle'}${rec}`);
+    res.end(`MdwnhBot ${VERSION} alive — voice: ${state.channelName || 'idle'}${rec} — chat logs ${state.chatOn ? 'on' : 'OFF'}`);
 }).listen(process.env.PORT || 3000);
 
 const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
