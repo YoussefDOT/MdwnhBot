@@ -3,6 +3,10 @@
 Relays who is talking in the Discord call to مقر المدونة (see the header of `index.js`),
 and records meetings on request.
 
+`@ليمو` from someone in a call brings it there — **a Stage channel too, any one, not just
+`STAGE_CHANNEL_ID`**. In a Stage it feeds the مقر hall (who is in it, who is a speaker,
+who is talking), and a summoned Stage outranks the default one.
+
 ## Recording a meeting
 
 | In any channel, while you are in a call | |

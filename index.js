@@ -16,6 +16,8 @@
 //      say {t:'hi'} in the relay's 'stage' room — and someone is in the Discord
 //      STAGE channel, it sits there, above everything else, and also tells the site
 //      who is a speaker: {t:'stage', ids:[in the channel], sp:[speakers]}.
+//      ANY Stage channel works the same way once it is summoned there (a mention from
+//      someone in it): that Stage outranks the default one and feeds the hall.
 //   3. Otherwise it leaves — LEAVE_GRACE_MS after the table empties, straight away if
 //      the call does. Disconnected by hand (right-click → Disconnect) = it stays out
 //      of that call for KICK_COOLDOWN_MS (a new mention overrides that).
@@ -58,7 +60,7 @@ const {
 } = require('@discordjs/voice');
 const { Recorder } = require('./record');
 
-const VERSION = 'v6-rec';
+const VERSION = 'v6.1-anystage';
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RELAY_BASE = process.env.RELAY_URL || 'wss://mdwnh-presence.yosefbore3y.workers.dev';
@@ -215,7 +217,12 @@ function onStageRelayMessage(data) {
     try { m = JSON.parse(s); } catch (_) { return; }
     recHallMsg(m);
 }
-function inStage() { return state.channelId === STAGE_CHANNEL_ID; }
+// In a Stage channel — the default one, or any other it was summoned to.
+function isStage(c) { return !!c && c.type === ChannelType.GuildStageVoice; }
+function inStage() {
+    if (!state.channelId || !state.guild) return false;
+    return state.channelId === STAGE_CHANNEL_ID || isStage(state.guild.channels.cache.get(state.channelId));
+}
 // Who is in the Stage channel, and who of them is a speaker: not suppressed AND
 // not merely invited. A moderator's «invite to speak» already sets suppress to
 // false, with requestToSpeakTimestamp set until the member accepts — counting
@@ -223,7 +230,7 @@ function inStage() { return state.channelId === STAGE_CHANNEL_ID; }
 let stageSendTimer = null;
 function sendStage() {
     if (!inStage() || !state.guild) return;
-    const ch = state.guild.channels.cache.get(STAGE_CHANNEL_ID);
+    const ch = state.guild.channels.cache.get(state.channelId);
     if (!ch) return;
     const humans = humansIn(ch);
     const sp = [];
@@ -287,8 +294,23 @@ setInterval(() => {
 }, 10000);
 
 // ── Which channel to sit in ───────────────────────────────────────────────────
+// Where the table may lead it: voice channels only (a Stage is the hall's).
 function voiceOk(c) {
     return !!c && c.isVoiceBased() && c.type !== ChannelType.GuildStageVoice && c.id !== c.guild.afkChannelId;
+}
+// Where a mention may bring it: any voice channel, a Stage included.
+function summonOk(c) {
+    return !!c && c.isVoiceBased() && c.id !== c.guild.afkChannelId;
+}
+// The summon, if whoever asked is still in that call (else it is over).
+function pinnedChannel(guild) {
+    if (!state.pin) return null;
+    const vs = guild.voiceStates.cache.get(state.pin.by);
+    const ch = guild.channels.cache.get(state.pin.channelId);
+    if (vs && vs.channelId === state.pin.channelId && summonOk(ch)) return ch;
+    console.log('📌 summon over — whoever asked left that call');
+    state.pin = null;
+    return null;
 }
 
 function pickChannel(guild) {
@@ -298,19 +320,16 @@ function pickChannel(guild) {
         if (ch && ch.isVoiceBased()) return ch;
         recStop('lost');
     }
+    // 0a) Summoned to a Stage channel: that Stage, above the default one.
+    const pinned = pinnedChannel(guild);
+    if (pinned && isStage(pinned)) return pinned;
     // 0) The general meeting: the Stage channel, while the hall is live and someone is in it.
     if (stageLive() && !(state.kicked && state.kicked.until > Date.now() && state.kicked.channelId === STAGE_CHANNEL_ID)) {
         const st = guild.channels.cache.get(STAGE_CHANNEL_ID);
         if (st && st.isVoiceBased() && humansIn(st).size > 0) return st;
     }
     // 1) Summoned: that call, for as long as whoever asked is still in it.
-    if (state.pin) {
-        const vs = guild.voiceStates.cache.get(state.pin.by);
-        const ch = guild.channels.cache.get(state.pin.channelId);
-        if (vs && vs.channelId === state.pin.channelId && voiceOk(ch)) return ch;
-        console.log('📌 summon over — whoever asked left that call');
-        state.pin = null;
-    }
+    if (pinned) return pinned;
     // 2) Following the meeting: the call the members at the site's table are in.
     const kicked = state.kicked && state.kicked.until > Date.now() ? state.kicked.channelId : null;
     const count = new Map();
@@ -335,7 +354,7 @@ function pickChannel(guild) {
 }
 
 function lobbiesFor(channel) {
-    if (channel.id === STAGE_CHANNEL_ID) return [STAGE_ROOM];
+    if (channel.id === STAGE_CHANNEL_ID || isStage(channel)) return [STAGE_ROOM];
     const cat = channel.parent ? channel.parent.name : null;
     const hit = Object.entries(LOBBY_CATEGORIES).find(([, name]) => name === cat);
     return hit ? [hit[0]] : Object.keys(LOBBY_CATEGORIES);
@@ -1033,7 +1052,7 @@ function onVoiceState(oldState, newState) {
         return;
     }
     // The Stage channel: someone came, went, was brought up or sent back down.
-    if (inStage() && (oldState.channelId === STAGE_CHANNEL_ID || newState.channelId === STAGE_CHANNEL_ID)) scheduleStageSend();
+    if (inStage() && (oldState.channelId === state.channelId || newState.channelId === state.channelId)) scheduleStageSend();
     // Someone left mid-sentence: make sure their green ring goes out.
     if (oldState.channelId === state.channelId && newState.channelId !== state.channelId) speakOff(oldState.id);
     recVoiceState(oldState, newState);
@@ -1057,7 +1076,7 @@ function onMessage(msg) {
     recLogDiscord(msg);
     if (!pinged || state.rec) return;   // while recording it stays in that call
     const ch = msg.member && msg.member.voice ? msg.member.voice.channel : null;
-    if (!voiceOk(ch)) { msg.react('🤷').catch(() => {}); return; }
+    if (!summonOk(ch)) { msg.react('🤷').catch(() => {}); return; }
     state.pin = { channelId: ch.id, by: msg.author.id };
     if (state.kicked && state.kicked.channelId === ch.id) state.kicked = null;
     state.leaveAt = 0;
