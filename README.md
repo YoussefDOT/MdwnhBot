@@ -13,6 +13,11 @@ they let go, leave the hall, or go silent for 2.5 min. It only ever unmutes memb
 muted itself, and gives every mute back on shutdown. Needs the **Mute Members**
 permission.
 
+**ليمو on الساحة's stage:** pressing «استدعاء ليمو» in the site brings the bot up to
+**speak in the Stage** it sits in (still self-muted); sending ليمو away puts it back in the
+audience. It only ever steps down if it stepped up itself. Needs **Mute Members** on the
+Stage (Stage moderator) — without it, it raises its hand instead and logs a warning.
+
 ## Recording a meeting
 
 | In any channel, while you are in a call | |

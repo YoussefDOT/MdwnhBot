@@ -24,6 +24,11 @@
 //      they stop ({t:'hv', k:'off'}, a 'hi' without hv, their 'bye', or MIC_STALE_MS of
 //      silence). Only members the bot muted itself are ever unmuted by it. Needs the
 //      «Mute Members» permission.
+//   ليمو on الساحة's stage: «استدعاء ليمو» in the site ({t:'flm', on:1} in the 'stage'
+//      room, re-asserted by every attendee's {t:'hi', lm:1}) brings the bot up to speak
+//      in the Stage channel it sits in; sending him away ({t:'flm', on:0}, or LM_STALE_MS
+//      with no 'lm') puts it back in the audience. Needs «Mute Members» on the Stage
+//      (a Stage moderator) — without it, it only raises its hand.
 //   3. Otherwise it leaves — LEAVE_GRACE_MS after the table empties, straight away if
 //      the call does. Disconnected by hand (right-click → Disconnect) = it stays out
 //      of that call for KICK_COOLDOWN_MS (a new mention overrides that).
@@ -66,7 +71,7 @@ const {
 } = require('@discordjs/voice');
 const { Recorder } = require('./record');
 
-const VERSION = 'v6.2-podium-mute';
+const VERSION = 'v6.3-lemo-stage';
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RELAY_BASE = process.env.RELAY_URL || 'wss://mdwnh-presence.yosefbore3y.workers.dev';
@@ -222,11 +227,74 @@ function onStageRelayMessage(data) {
         || (hi && (micOn.size > 0 || s.indexOf('"hv"') !== -1));
     const rec = state.rec && state.rec.live
         && (hi || s.indexOf('"t":"hc"') !== -1 || s.indexOf('"t":"hsg"') !== -1);
-    if (!mic && !rec) return;
+    const lm = s.indexOf('"t":"flm"') !== -1 || (hi && s.indexOf('"lm"') !== -1);
+    if (!mic && !rec && !lm) return;
     let m;
     try { m = JSON.parse(s); } catch (_) { return; }
     if (mic) onMicMsg(m);
     if (rec) recHallMsg(m);
+    if (lm) onLemoMsg(m);
+}
+
+// ── ليمو on الساحة's stage: the bot comes up to speak in the Stage while he is there ──
+const LM_STALE_MS = 70000;            // the hall's 'hi' (with lm) re-asserts it every 20 s
+const LM_FAIL_MS = 60000;             // a refused step up / down is not retried for this long
+let lmAt = 0, lmOffAt = 0, lmBusy = false, lmFailUntil = 0, lmTimer = null;
+let lmUp = false, lmHand = false;    // what WE did — a moderator's own move is never undone
+function lmWanted() { return lmAt > 0 && Date.now() - lmAt < LM_STALE_MS; }
+function onLemoMsg(m) {
+    if (!m || typeof m.uid !== 'string' || !DISCORD_ID_RE.test(m.uid)) return;
+    const was = lmWanted();
+    if (m.t === 'flm') { lmAt = m.on === 1 ? Date.now() : 0; if (!lmAt) lmOffAt = Date.now(); }
+    // A 'hi' sent just before that attendee heard he left must not call him back.
+    else if (m.t === 'hi' && m.lm === 1) { if (Date.now() - lmOffAt > 5000) lmAt = Date.now(); }
+    else return;
+    if (was !== lmWanted()) { lmFailUntil = 0; console.log(`🤖 ليمو ${lmWanted() ? 'called onto' : 'sent off'} الساحة's stage`); }
+    lmSoon();
+}
+function lmSoon() {
+    if (lmTimer) return;
+    lmTimer = setTimeout(() => { lmTimer = null; lmSync(); }, 0);
+}
+async function lmSync() {
+    const g = state.guild;
+    if (!g || lmBusy || lmFailUntil > Date.now() || !inStage()) return;
+    const vs = g.members.me && g.members.me.voice;
+    if (!vs || vs.channelId !== state.channelId) return;
+    const want = lmWanted();
+    const up = vs.suppress === false;
+    const hand = !!vs.requestToSpeakTimestamp;
+    if (!up) lmUp = false;
+    if (!hand) lmHand = false;
+    if (want ? up : !(up && lmUp) && !(hand && lmHand)) return;
+    lmBusy = true;
+    try {
+        if (want) {
+            try {
+                await vs.setSuppressed(false);
+                lmUp = true;
+                console.log('🎤 up on the Stage as a speaker (ليمو is on الساحة\'s stage)');
+            } catch (err) {
+                lmFailUntil = Date.now() + LM_FAIL_MS;
+                if (!hand) await vs.setRequestToSpeak(true).then(() => { lmHand = true; }, () => {});
+                console.warn(`⚠️ could not come up on the Stage: ${err && err.message}`
+                    + (err && err.code === 50013 ? ' — give the bot «Mute Members» on the Stage (raised its hand instead)' : ''));
+            }
+        } else if (up && lmUp) {
+            await vs.setSuppressed(true);
+            lmUp = false;
+            console.log('🪑 back in the Stage audience (ليمو left الساحة\'s stage)');
+        } else if (hand && lmHand) {
+            await vs.setRequestToSpeak(false);
+            lmHand = false;
+        }
+    } catch (err) {
+        lmFailUntil = Date.now() + LM_FAIL_MS;
+        console.warn(`⚠️ could not leave the Stage's speakers: ${err && err.message}`);
+    } finally {
+        lmBusy = false;
+        if (!lmFailUntil || lmFailUntil <= Date.now()) lmSoon();   // things may have moved meanwhile
+    }
 }
 
 // ── منصة الميكروفون: whoever speaks from الساحة's podium is muted in Discord ─────
@@ -400,6 +468,8 @@ setInterval(() => {
     // The hall went quiet (the meeting ended): the Stage channel is no longer wanted.
     if (inStage() && !stageLive()) scheduleRescan(0);
     if (micOn.size || micMuted.size) micSync();
+    if (lmAt && !lmWanted()) lmAt = 0;
+    if (lmAt || lmUp || lmHand) lmSync();
 }, 10000);
 
 // ── Which channel to sit in ───────────────────────────────────────────────────
@@ -1162,6 +1232,8 @@ function onVoiceState(oldState, newState) {
             sendHeartbeat();
             scheduleRescan();
         }
+        // Joined / was moved within a Stage: step up again if ليمو is still there.
+        if (lmAt) lmSoon();
         return;
     }
     // The Stage channel: someone came, went, was brought up or sent back down.
