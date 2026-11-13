@@ -7,6 +7,12 @@ and records meetings on request.
 `STAGE_CHANNEL_ID`**. In a Stage it feeds the مقر hall (who is in it, who is a speaker,
 who is talking), and a summoned Stage outranks the default one.
 
+**الساحة's podium mic:** whoever speaks from the podium in the site is **server-muted in
+Discord** while they hold the mic (only in the call the bot sits in), and unmuted when
+they let go, leave the hall, or go silent for 2.5 min. It only ever unmutes members it
+muted itself, and gives every mute back on shutdown. Needs the **Mute Members**
+permission.
+
 ## Recording a meeting
 
 | In any channel, while you are in a call | |

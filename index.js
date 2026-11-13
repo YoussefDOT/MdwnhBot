@@ -18,6 +18,12 @@
 //      who is a speaker: {t:'stage', ids:[in the channel], sp:[speakers]}.
 //      ANY Stage channel works the same way once it is summoned there (a mention from
 //      someone in it): that Stage outranks the default one and feeds the hall.
+//   الساحة's podium mic: whoever speaks from the podium IN THE SITE ({t:'hv', k:'on'}
+//      in the 'stage' room, refreshed by their {t:'hi', hv}) is server-muted in Discord
+//      while they hold it — if they are in the call the bot sits in — and unmuted when
+//      they stop ({t:'hv', k:'off'}, a 'hi' without hv, their 'bye', or MIC_STALE_MS of
+//      silence). Only members the bot muted itself are ever unmuted by it. Needs the
+//      «Mute Members» permission.
 //   3. Otherwise it leaves — LEAVE_GRACE_MS after the table empties, straight away if
 //      the call does. Disconnected by hand (right-click → Disconnect) = it stays out
 //      of that call for KICK_COOLDOWN_MS (a new mention overrides that).
@@ -60,7 +66,7 @@ const {
 } = require('@discordjs/voice');
 const { Recorder } = require('./record');
 
-const VERSION = 'v6.1-anystage';
+const VERSION = 'v6.2-podium-mute';
 
 // ── Config ───────────────────────────────────────────────────────────────────
 const RELAY_BASE = process.env.RELAY_URL || 'wss://mdwnh-presence.yosefbore3y.workers.dev';
@@ -211,11 +217,113 @@ function onStageRelayMessage(data) {
         state.stageLiveAt = Date.now();
         if (!was) { console.log('🎤 the hall is live'); scheduleRescan(0); }
     }
-    if (!state.rec || !state.rec.live) return;
-    if (!hi && s.indexOf('"t":"hc"') === -1 && s.indexOf('"t":"hsg"') === -1) return;
+    // Every avatar's position flows through here too: parse only what is asked for.
+    const mic = s.indexOf('"t":"hv"') !== -1 || s.indexOf('"bye"') !== -1
+        || (hi && (micOn.size > 0 || s.indexOf('"hv"') !== -1));
+    const rec = state.rec && state.rec.live
+        && (hi || s.indexOf('"t":"hc"') !== -1 || s.indexOf('"t":"hsg"') !== -1);
+    if (!mic && !rec) return;
     let m;
     try { m = JSON.parse(s); } catch (_) { return; }
-    recHallMsg(m);
+    if (mic) onMicMsg(m);
+    if (rec) recHallMsg(m);
+}
+
+// ── منصة الميكروفون: whoever speaks from الساحة's podium is muted in Discord ─────
+// The site carries their voice (with its reverb) to the field; the same voice in the
+// Discord call would be heard twice. So the bot server-mutes them while they hold the
+// podium mic — only in the call it sits in (the hall's Stage) — and unmutes them when
+// they let go. The uid is client-claimed like everything on the relay; keeping the
+// mute to the bot's own call and to while it is re-asserted limits what a spoof does.
+const MIC_STALE_MS = STAGE_LIVE_MS;   // their 'hi' (with hv) re-asserts it every 20 s
+const MIC_FAIL_MS = 60000;            // a refused mute is not retried for this long
+const MIC_REASON = 'يتكلم من منصة الساحة في مقر المدونة';
+const micOn = new Map();              // site uid → last heard holding the mic (ms)
+const micMuted = new Set();           // Discord ids WE server-muted — the only ones we unmute
+const micBusy = new Set();
+const micFail = new Map();            // Discord id → no retry before (ms)
+let micWarned = false;
+
+function onMicMsg(m) {
+    if (!m || typeof m.uid !== 'string' || !DISCORD_ID_RE.test(m.uid)) return;
+    const uid = m.uid, now = Date.now();
+    if (m.t === 'hv') {
+        if (m.k === 'on') {
+            if (!micOn.has(uid)) { console.log(`🎙️ podium mic on: ${memberName(uid)}`); loadTeam().then(micSoon); }
+            micOn.set(uid, now);
+        } else if (m.k === 'off') {
+            if (!micOn.delete(uid)) return;
+            console.log(`🎙️ podium mic off: ${memberName(uid)}`);
+        } else return;
+    } else if (m.t === 'hi') {
+        if (m.hv && typeof m.hv === 'object') { if (!micOn.has(uid)) loadTeam().then(micSoon); micOn.set(uid, now); }
+        else if (!micOn.delete(uid)) return;
+    } else if (m.t === 'bye') {
+        if (!micOn.delete(uid)) return;
+    } else return;
+    micSync();
+}
+// The site's uid is the member's PRIMARY Discord id; they may be in the call on an alt.
+function micAccounts(uid) {
+    const rec = _team && _team.byId.get(uid);
+    return rec && rec.ids.length ? rec.ids : [uid];
+}
+let micTimer = null;
+function micSoon() {
+    if (micTimer) return;
+    micTimer = setTimeout(() => { micTimer = null; micSync(); }, 0);
+}
+function micSync() {
+    const g = state.guild;
+    if (!g) return;
+    const now = Date.now();
+    for (const [uid, at] of micOn) if (now - at > MIC_STALE_MS) micOn.delete(uid);
+    const want = new Set();
+    if (state.channelId) {
+        for (const uid of micOn.keys()) for (const id of micAccounts(uid)) {
+            const vs = g.voiceStates.cache.get(id);
+            if (vs && vs.channelId === state.channelId) want.add(id);
+        }
+    }
+    for (const id of want) if (!micMuted.has(id)) micMute(id, true);
+    for (const id of [...micMuted]) if (!want.has(id)) micMute(id, false);
+}
+async function micMute(id, on) {
+    const g = state.guild;
+    if (!g || micBusy.has(id) || (micFail.get(id) || 0) > Date.now()) return;
+    const vs = g.voiceStates.cache.get(id);
+    // Unmuting needs them in a voice channel: if they left, it stays owed (kept in
+    // micMuted) and is paid the moment they join one again (onVoiceState → micSync).
+    if (!vs || !vs.channelId) return;
+    if (on && vs.serverMute) return;                        // a moderator's mute: not ours
+    if (!on && !vs.serverMute) { micMuted.delete(id); return; }   // already unmuted by someone
+    micBusy.add(id);
+    try {
+        await vs.setMute(on, MIC_REASON);
+        if (on) micMuted.add(id); else micMuted.delete(id);
+        console.log(`${on ? '🔇 muted' : '🔊 unmuted'} ${memberName(id)} (podium mic)`);
+    } catch (err) {
+        micFail.set(id, Date.now() + MIC_FAIL_MS);
+        if (!micWarned || (err && err.code !== 50013)) {
+            micWarned = true;
+            console.warn(`⚠️ could not ${on ? 'mute' : 'unmute'} ${memberName(id)}: ${err && err.message}`
+                + (err && err.code === 50013 ? ' — give the bot «Mute Members»' : ''));
+        }
+    } finally {
+        micBusy.delete(id);
+        micSoon();   // things may have moved while the request was out
+    }
+}
+// Shutting down: give back every mute we put on (a restart must not leave one behind).
+async function micReleaseAll() {
+    micOn.clear();
+    const g = state.guild;
+    if (!g || !micMuted.size) return;
+    await Promise.allSettled([...micMuted].map(id => {
+        const vs = g.voiceStates.cache.get(id);
+        return vs && vs.channelId && vs.serverMute ? vs.setMute(false, MIC_REASON) : null;
+    }));
+    micMuted.clear();
 }
 // In a Stage channel — the default one, or any other it was summoned to.
 function isStage(c) { return !!c && c.type === ChannelType.GuildStageVoice; }
@@ -291,6 +399,7 @@ setInterval(() => {
     for (const at of state.seated.values()) if (now - at > SEAT_STALE_MS) { scheduleRescan(0); return; }
     // The hall went quiet (the meeting ended): the Stage channel is no longer wanted.
     if (inStage() && !stageLive()) scheduleRescan(0);
+    if (micOn.size || micMuted.size) micSync();
 }, 10000);
 
 // ── Which channel to sit in ───────────────────────────────────────────────────
@@ -374,6 +483,7 @@ function leaveVoice() {
     state.channelName = null;
     state.lobbies = [];
     state.leaveAt = 0;
+    if (micMuted.size) micSoon();   // out of the call: nobody there to keep muted
 }
 
 function joinChannel(channel) {
@@ -385,6 +495,7 @@ function joinChannel(channel) {
     state.lobbies = lobbiesFor(channel);
     for (const l of state.lobbies) relayOpen(l);
     console.log(`🎙️ joining voice: ${channel.name} → lobbies ${state.lobbies.join(', ')}`);
+    if (micOn.size || micMuted.size) micSoon();
 
     // Deafened bots receive no audio packets — and the speaking events come from
     // those packets — so: muted, NOT deafened. Outside a recording it never subscribes
@@ -511,10 +622,10 @@ async function loadTeam() {
     for (const m of ((roster && roster.members) || [])) {
         if (!m || !m.slug || m.dummy) continue;
         const p = prof[m.slug] || {};
-        const rec = { name: m.name, role: p.role || '', depts: Array.isArray(p.depts) ? p.depts : [] };
+        const rec = { name: m.name, role: p.role || '', depts: Array.isArray(p.depts) ? p.depts : [], ids: [] };
         if (m.active !== false) list.push(rec);
         for (const id of [m.discordId, ...(Array.isArray(m.altDiscordIds) ? m.altDiscordIds : [])]) {
-            if (id) byId.set(String(id), rec);
+            if (id) { byId.set(String(id), rec); rec.ids.push(String(id)); }
         }
     }
     const team = { byId, list };
@@ -1020,6 +1131,8 @@ function onReady() {
 
 function onVoiceState(oldState, newState) {
     if (!state.guild) return;
+    // The podium mic: someone came into / left the call, or a mute we owe can be paid.
+    if (micOn.size || micMuted.size) micSoon();
     if (oldState.id === client.user.id || newState.id === client.user.id) {
         // Disconnected by hand (right-click → Disconnect): take the hint and stay out of
         // that call for a while instead of hopping straight back in. Our own leaves
@@ -1123,6 +1236,7 @@ process.on('unhandledRejection', err => console.error('❌ Unhandled rejection:'
 // A redeploy / restart mid-recording: send what was recorded before going (Render
 // allows ~30 s between SIGTERM and the kill).
 async function shutdown(sig) {
+    await Promise.race([micReleaseAll(), sleep(4000)]);
     if (state.rec && state.rec.live) { console.log(`⏹️ ${sig} — finishing the recording first`); recStop('restart'); }
     else state.rec = null;
     if (state.finishing.size) await Promise.race([Promise.allSettled([...state.finishing]), sleep(25000)]);
